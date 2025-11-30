@@ -31,6 +31,9 @@ enum Command {
         /// Root directory to index (e.g. C:\Users\You\Documents)
         #[arg(long, value_hint = ValueHint::DirPath)]
         root: String,
+        /// Recreate the index directory if it already exists
+        #[arg(long)]
+        force: bool,
     },
 
     /// Re-scan the filesystem and update the index
@@ -66,8 +69,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { root } => {
-            cmd_init(&root)?;
+        Command::Init { root, force } => {
+            cmd_init(&root, force)?;
         }
         Command::Index => {
             cmd_index()?;
@@ -82,7 +85,7 @@ fn main() -> Result<()> {
 
 // ---- Commands ----
 
-fn cmd_init(root: &str) -> Result<()> {
+fn cmd_init(root: &str, force: bool) -> Result<()> {
     // 1) Check the root directory exists.
     let root_path = fs::canonicalize(root)
         .with_context(|| format!("Root path does not exist or is invalid: {root}"))?;
@@ -100,11 +103,48 @@ fn cmd_init(root: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
     }
+
+    let index_already_present = tantivy_index_exists(&index_dir);
+
+    if index_already_present && force {
+        println!(
+            "Index already exists at {}. Removing and recreating because --force was provided.",
+            index_dir.display()
+        );
+        fs::remove_dir_all(&index_dir).with_context(|| {
+            format!(
+                "Failed to remove existing index directory: {}",
+                index_dir.display()
+            )
+        })?;
+    }
+
     fs::create_dir_all(&index_dir)
         .with_context(|| format!("Failed to create index directory: {}", index_dir.display()))?;
 
-    // 3) Create the Tantivy index (schema + empty index).
-    create_empty_index(&index_dir)?;
+    // 3) Create or validate the Tantivy index (schema + empty index).
+    let index_status = if index_already_present && !force {
+        let existing_index = open_index(&index_dir).with_context(|| {
+            format!(
+                "Failed to open existing index at {}. Re-run with --force to recreate it.",
+                index_dir.display()
+            )
+        })?;
+
+        let existing_schema = existing_index.schema();
+        let expected_schema = build_schema();
+
+        if existing_schema != expected_schema {
+            anyhow::bail!(
+                "Existing index schema does not match expected schema. Re-run with --force to recreate the index."
+            );
+        }
+
+        "Reused existing Tantivy index."
+    } else {
+        create_empty_index(&index_dir)?;
+        "Created new Tantivy index."
+    };
 
     // 4) Save config file.
     let cfg = AppConfig {
@@ -119,6 +159,7 @@ fn cmd_init(root: &str) -> Result<()> {
     println!("Initialized vaultsearch:");
     println!("  Root directory : {}", cfg.root);
     println!("  Index directory: {}", cfg.index_dir);
+    println!("  Index status   : {index_status}");
     println!("  Config file    : {}", config_path.display());
 
     Ok(())
@@ -278,6 +319,10 @@ fn load_config() -> Result<AppConfig> {
 }
 
 // ---- Index helpers ----
+
+fn tantivy_index_exists(index_dir: &Path) -> bool {
+    index_dir.join("meta.json").exists()
+}
 
 fn create_empty_index(index_dir: &Path) -> Result<()> {
     let schema = build_schema();

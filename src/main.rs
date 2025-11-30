@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueHint};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -7,8 +7,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, SchemaBuilder, STORED, TEXT, TantivyDocument};
-use tantivy::{doc, Index};
+use tantivy::schema::{Schema, SchemaBuilder, TantivyDocument, STORED, TEXT};
+use tantivy::{doc, Document, Index};
 
 /// Local file search tool (offline, private).
 #[derive(Parser, Debug)]
@@ -28,7 +28,7 @@ enum Command {
     /// Initialize config and index for a root folder
     Init {
         /// Root directory to index (e.g. C:\Users\You\Documents)
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::DirPath)]
         root: String,
     },
 
@@ -49,6 +49,15 @@ struct AppConfig {
     /// Directory where the Tantivy index is stored
     index_dir: String,
 }
+
+const INDEX_WRITER_HEAP_BYTES: usize = 50_000_000;
+const INDEX_PROGRESS_CHUNK: usize = 100;
+const TOP_RESULTS: usize = 20;
+const TEXT_LIKE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "rst", "log", "json", "toml", "yaml", "yml", "ini", "cfg", "rs", "lock", "c",
+    "cpp", "h", "hpp", "cs", "java", "py", "go", "rb", "php", "js", "ts", "tsx", "jsx", "html",
+    "htm", "css", "sh", "bash", "ps1", "bat", "tex", "csv",
+];
 
 // ---- Entry point ----
 
@@ -102,8 +111,7 @@ fn cmd_init(root: &str) -> Result<()> {
         index_dir: index_dir.to_string_lossy().to_string(),
     };
 
-    let cfg_toml =
-        toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
+    let cfg_toml = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
     fs::write(&config_path, cfg_toml)
         .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
 
@@ -132,7 +140,7 @@ fn cmd_index() -> Result<()> {
 
     // Tantivy index writer: 50 MB heap
     let mut writer = index
-        .writer(50_000_000)
+        .writer(INDEX_WRITER_HEAP_BYTES)
         .context("Failed to create Tantivy index writer")?;
 
     let mut indexed_files = 0usize;
@@ -169,7 +177,7 @@ fn cmd_index() -> Result<()> {
 
                 indexed_files += 1;
 
-                if indexed_files % 100 == 0 {
+                if indexed_files % INDEX_PROGRESS_CHUNK == 0 {
                     println!("  Indexed {indexed_files} files so far...");
                 }
             }
@@ -180,9 +188,7 @@ fn cmd_index() -> Result<()> {
         }
     }
 
-    writer
-        .commit()
-        .context("Failed to commit index to disk")?;
+    writer.commit().context("Failed to commit index to disk")?;
 
     println!("Indexing complete.");
     println!("  Indexed files : {indexed_files}");
@@ -213,9 +219,8 @@ fn cmd_search(query: &str) -> Result<()> {
         .parse_query(query)
         .with_context(|| format!("Failed to parse query: {query}"))?;
 
-    // Top 20 results
     let top_docs = searcher
-        .search(&tantivy_query, &TopDocs::with_limit(20))
+        .search(&tantivy_query, &TopDocs::with_limit(TOP_RESULTS))
         .context("Search failed")?;
 
     if top_docs.is_empty() {
@@ -225,19 +230,13 @@ fn cmd_search(query: &str) -> Result<()> {
 
     println!("Results for query: {query}");
     for (rank, (score, doc_address)) in top_docs.into_iter().enumerate() {
-        // Fetch as TantivyDocument and just print JSON.
         let retrieved_doc: TantivyDocument = searcher
             .doc(doc_address)
             .context("Failed to load document")?;
 
         let json = retrieved_doc.to_json(&schema);
 
-        println!(
-            "{:>2}. [score: {:.3}] {}",
-            rank + 1,
-            score,
-            json
-        );
+        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, json);
     }
 
     Ok(())
@@ -273,8 +272,7 @@ fn load_config() -> Result<AppConfig> {
         )
     })?;
 
-    let cfg: AppConfig =
-        toml::from_str(&data).with_context(|| "Failed to parse config TOML")?;
+    let cfg: AppConfig = toml::from_str(&data).with_context(|| "Failed to parse config TOML")?;
     Ok(cfg)
 }
 
@@ -306,28 +304,18 @@ fn build_schema() -> Schema {
 // ---- File helpers ----
 
 fn is_text_like(path: &Path) -> bool {
-    let exts: &[&str] = &[
-        "txt", "md", "rst", "log",
-        "json", "toml", "yaml", "yml", "ini", "cfg",
-        "rs", "lock",
-        "c", "cpp", "h", "hpp", "cs", "java", "py", "go", "rb", "php",
-        "js", "ts", "tsx", "jsx", "html", "htm", "css",
-        "sh", "bash", "ps1", "bat",
-        "tex", "csv",
-    ];
-
     match path.extension().and_then(|s| s.to_str()) {
         Some(ext) => {
             let ext_lower = ext.to_ascii_lowercase();
-            exts.contains(&ext_lower.as_str())
+            TEXT_LIKE_EXTENSIONS.contains(&ext_lower.as_str())
         }
         None => false,
     }
 }
 
 fn read_file_to_string(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("Failed to open file {}", path.display()))?;
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open file {}", path.display()))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .with_context(|| format!("Failed to read file {}", path.display()))?;

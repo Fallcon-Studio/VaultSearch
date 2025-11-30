@@ -26,6 +26,7 @@ executable so you can see its output. From the repository root after building, r
 cd target\release
 ./vaultsearch.exe --help
 ./vaultsearch.exe init --root C:\\path\\to\\documents
+# The binary will be at target/release/vaultsearch
 ```
 
 ## Usage

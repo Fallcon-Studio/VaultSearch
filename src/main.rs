@@ -13,10 +13,11 @@ use tantivy::{doc, Document, Index};
 /// Local file search tool (offline, private).
 #[derive(Parser, Debug)]
 #[command(
-    name = "vault",
+    name = "vaultsearch",
     version,
     about = "Vault: local, offline file search",
-    author = "You"
+    author = "You",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]

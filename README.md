@@ -16,6 +16,16 @@ VaultSearch is a privacy-focused, offline search utility that builds a local Tan
 ```bash
 # From the repository root
 cargo build --release
+# The binary will be at target/release/vaultsearch (or vaultsearch.exe on Windows)
+```
+
+On Windows, run the tool from a terminal such as PowerShell rather than double-clicking the
+executable so you can see its output. From the repository root after building, run:
+
+```powershell
+cd target\release
+./vaultsearch.exe --help
+./vaultsearch.exe init --root C:\\path\\to\\documents
 # The binary will be at target/release/vaultsearch
 ```
 

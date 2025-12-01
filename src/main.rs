@@ -5,7 +5,7 @@ use directories::ProjectDirs;
 use html_escape::decode_html_entities;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -63,6 +63,8 @@ struct AppConfig {
 const INDEX_WRITER_HEAP_BYTES: usize = 50_000_000;
 const INDEX_PROGRESS_CHUNK: usize = 100;
 const TOP_RESULTS: usize = 20;
+const MAX_FILE_SIZE_BYTES: u64 = 5_000_000;
+const BINARY_SNIFF_BYTES: usize = 4_096;
 const TEXT_LIKE_EXTENSIONS: &[&str] = &[
     "txt", "md", "rst", "log", "json", "toml", "yaml", "yml", "ini", "cfg", "rs", "lock", "c",
     "cpp", "h", "hpp", "cs", "java", "py", "go", "rb", "php", "js", "ts", "tsx", "jsx", "html",
@@ -298,7 +300,7 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
         .context("Failed to clear existing index documents")?;
 
     let mut indexed_files = 0usize;
-    let mut skipped_files = 0usize;
+    let mut skip_stats = SkipStats::default();
 
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
@@ -310,13 +312,47 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
             continue;
         }
 
-        // Only index "text-like" files based on extension for now.
+        let path_display = path.display();
+
         if !is_text_like(path) {
-            skipped_files += 1;
+            eprintln!("  [skip] Unsupported extension: {path_display}");
+            skip_stats.unsupported_extension += 1;
             continue;
         }
 
-        match read_file_to_string(path) {
+        let metadata = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                eprintln!("  [skip] Failed to read metadata for {path_display}: {e}");
+                skip_stats.read_errors += 1;
+                continue;
+            }
+        };
+
+        if metadata.len() > MAX_FILE_SIZE_BYTES {
+            eprintln!(
+                "  [skip] File exceeds size limit ({} bytes): {path_display}",
+                metadata.len()
+            );
+            skip_stats.too_large += 1;
+            continue;
+        }
+
+        match is_probably_binary(path) {
+            Ok(true) => {
+                eprintln!("  [skip] Detected binary content: {path_display}");
+                skip_stats.binary += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("  [skip] Failed to sniff {path_display}: {e}");
+                skip_stats.read_errors += 1;
+                continue;
+            }
+        }
+
+        match read_file_streaming(path, metadata.len()) {
             Ok(contents) => {
                 let path_str = path.to_string_lossy().to_string();
 
@@ -336,8 +372,8 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("  [skip] Failed to read {}: {e}", path.display());
-                skipped_files += 1;
+                eprintln!("  [skip] Failed to read {}: {e}", path_display);
+                skip_stats.read_errors += 1;
             }
         }
     }
@@ -349,13 +385,34 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
 
     println!("Indexing complete.");
     println!("  Indexed files : {indexed_files}");
-    println!("  Skipped files : {skipped_files}");
+    println!("  Skipped files : {}", skip_stats.total());
+    println!(
+        "    - Unsupported extension : {}",
+        skip_stats.unsupported_extension
+    );
+    println!("    - Too large             : {}", skip_stats.too_large);
+    println!("    - Binary content        : {}", skip_stats.binary);
+    println!("    - Read errors           : {}", skip_stats.read_errors);
     println!(
         "  Last indexed  : {}",
         cfg.last_indexed.as_deref().unwrap_or("unknown")
     );
 
     Ok(())
+}
+
+#[derive(Default)]
+struct SkipStats {
+    unsupported_extension: usize,
+    too_large: usize,
+    binary: usize,
+    read_errors: usize,
+}
+
+impl SkipStats {
+    fn total(&self) -> usize {
+        self.unsupported_extension + self.too_large + self.binary + self.read_errors
+    }
 }
 
 // ---- Config helpers ----
@@ -446,13 +503,51 @@ fn is_text_like(path: &Path) -> bool {
     }
 }
 
-fn read_file_to_string(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("Failed to open file {}", path.display()))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
+fn is_probably_binary(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("Failed to open file {} for sniffing", path.display()))?;
+    let mut buf = [0u8; BINARY_SNIFF_BYTES];
+    let bytes_read = file
+        .read(&mut buf)
         .with_context(|| format!("Failed to read file {}", path.display()))?;
+    let sample = &buf[..bytes_read];
 
-    // Lossy to avoid panicking on weird encodings
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    if sample.iter().any(|&b| b == 0) {
+        return Ok(true);
+    }
+
+    if std::str::from_utf8(sample).is_err() {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn read_file_streaming(path: &Path, size_hint: u64) -> Result<String> {
+    let file =
+        fs::File::open(path).with_context(|| format!("Failed to open file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut contents = String::new();
+    let mut line = String::new();
+    let mut total_bytes: u64 = 0;
+
+    while reader
+        .read_line(&mut line)
+        .with_context(|| format!("Failed to read from file {}", path.display()))?
+        > 0
+    {
+        total_bytes += line.as_bytes().len() as u64;
+
+        if total_bytes > MAX_FILE_SIZE_BYTES || size_hint > MAX_FILE_SIZE_BYTES {
+            anyhow::bail!(
+                "File exceeded size limit while reading (limit {} bytes)",
+                MAX_FILE_SIZE_BYTES
+            );
+        }
+
+        contents.push_str(&line);
+        line.clear();
+    }
+
+    Ok(contents)
 }

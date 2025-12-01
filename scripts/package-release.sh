@@ -45,8 +45,9 @@ for target in $TARGETS; do
   sha256sum "$archive_name" >"$archive_name.sha256"
 
   if [[ "${SIGN_ARTIFACTS:-0}" == "1" ]]; then
-    gpg_args=(--detach-sign --armor)
+    gpg_args=(--batch --yes --detach-sign --armor)
     [[ -n "${GPG_SIGNING_KEY:-}" ]] && gpg_args+=(--local-user "$GPG_SIGNING_KEY")
+    [[ -n "${GPG_PASSPHRASE:-}" ]] && gpg_args+=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
     gpg "${gpg_args[@]}" "$archive_name"
   fi
   popd >/dev/null

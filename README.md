@@ -1,4 +1,5 @@
 # VaultSearch
+[![CI](https://github.com/your-org/VaultSearch/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/VaultSearch/actions/workflows/ci.yml)
 
 VaultSearch is a privacy-focused, offline search utility that builds a local Tantivy index over a folder of text-like files. It provides a simple command-line interface to initialize configuration, index your files, and search for matches without sending data anywhere else.
 
@@ -76,6 +77,11 @@ You can edit `config.toml` manually if you need to change the root or index loca
 - Checksums and signatures: the packaging script writes a `.sha256` file next to each archive and, when `SIGN_ARTIFACTS=1` is set, generates an armored detached signature (`.asc`) using `gpg` (optionally controlled by `GPG_SIGNING_KEY`). These live in `dist/` alongside the archives.
 - Verification: `cd dist && sha256sum -c vaultsearch-<VERSION>-<TARGET>.tar.gz.sha256` (or `.zip.sha256`) to check the checksum, then `gpg --verify vaultsearch-<VERSION>-<TARGET>.tar.gz.asc` if signatures were produced.
 - Prerequisites: the Rust toolchain (with `rustup` for target installation), `jq` for reading cargo metadata, `tar` and `zip` for packaging, and optionally `gpg` for signatures.
+
+## Continuous integration
+- GitHub Actions (`ci.yml`) runs `cargo fmt`, `cargo clippy`, and `cargo test` on every push and pull request.
+- Pushes also trigger release builds for the supported targets listed above. Archives, checksum files, and (on tags) optional signatures are uploaded as workflow artifacts. Set `GPG_PRIVATE_KEY`, `GPG_PASSPHRASE` (if needed), and `GPG_SIGNING_KEY` secrets to enable signing.
+
 
 ## Release notes and versioning
 - VaultSearch follows semantic versioning; the current release is **0.2.0** (see `Cargo.toml`).

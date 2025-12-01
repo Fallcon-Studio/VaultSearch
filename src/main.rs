@@ -8,8 +8,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, SchemaBuilder, TantivyDocument, STORED, TEXT};
-use tantivy::{doc, Document, Index};
+use tantivy::schema::{Schema, SchemaBuilder, TantivyDocument, Value, STORED, TEXT};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{doc, Index};
 
 /// Local file search tool (offline, private).
 #[derive(Parser, Debug)]
@@ -219,6 +220,10 @@ fn cmd_search(query: &str) -> Result<()> {
         .parse_query(query)
         .with_context(|| format!("Failed to parse query: {query}"))?;
 
+    let mut snippet_generator = SnippetGenerator::create(&searcher, &tantivy_query, contents_field)
+        .context("Failed to create snippet generator")?;
+    snippet_generator.set_max_num_chars(200);
+
     let top_docs = searcher
         .search(&tantivy_query, &TopDocs::with_limit(TOP_RESULTS))
         .context("Search failed")?;
@@ -234,9 +239,15 @@ fn cmd_search(query: &str) -> Result<()> {
             .doc(doc_address)
             .context("Failed to load document")?;
 
-        let json = retrieved_doc.to_json(&schema);
+        let path_value = retrieved_doc
+            .get_first(path_field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown path>");
 
-        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, json);
+        let snippet = snippet_generator.snippet_from_doc(&retrieved_doc).to_html();
+
+        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, path_value);
+        println!("      {snippet}");
     }
 
     Ok(())
@@ -400,7 +411,7 @@ fn build_schema() -> Schema {
     schema_builder.add_text_field("path", TEXT | STORED);
 
     // Contents: main text content we will index for full-text search.
-    schema_builder.add_text_field("contents", TEXT);
+    schema_builder.add_text_field("contents", TEXT | STORED);
 
     schema_builder.build()
 }

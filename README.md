@@ -85,3 +85,6 @@ You can edit `config.toml` manually if you need to change the root or index loca
 
 ## Notes
 This project aims to stay offline-first. Keep your index on trusted storage and run searches locally to maintain privacy.
+
+## License
+VaultSearch is licensed under the MIT License. See [LICENSE](LICENSE) for details about the permissions and limitations.

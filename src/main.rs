@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueHint};
 use directories::ProjectDirs;
+use html_escape::decode_html_entities;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
@@ -244,13 +245,25 @@ fn cmd_search(query: &str) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown path>");
 
-        let snippet = snippet_generator.snippet_from_doc(&retrieved_doc).to_html();
+        let snippet_html = snippet_generator.snippet_from_doc(&retrieved_doc).to_html();
+        let snippet = highlight_snippet(&snippet_html);
+        let relative_path = Path::new(path_value)
+            .strip_prefix(&cfg.root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path_value.to_string());
 
-        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, path_value);
+        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, relative_path);
         println!("      {snippet}");
+        println!();
     }
 
     Ok(())
+}
+
+fn highlight_snippet(snippet_html: &str) -> String {
+    let decoded = decode_html_entities(snippet_html);
+    let with_bold = decoded.replace("<b>", "\x1b[1m").replace("</b>", "\x1b[0m");
+    with_bold
 }
 
 fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {

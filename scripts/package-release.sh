@@ -5,22 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 TARGETS=${TARGETS:-"x86_64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-apple-darwin"}
 
-VERSION=$(python - <<'PY'
-import json
-import subprocess
+VERSION=$(cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | select(.name=="vaultsearch").version' \
+  | head -n1)
 
-metadata = json.loads(subprocess.check_output([
-    "cargo",
-    "metadata",
-    "--no-deps",
-    "--format-version",
-    "1",
-]))
-
-package = next(pkg for pkg in metadata["packages"] if pkg["name"] == "vaultsearch")
-print(package["version"])
-PY
-)
+if [[ -z "$VERSION" ]]; then
+  echo "Failed to read package version from cargo metadata" >&2
+  exit 1
+fi
 
 echo "Building VaultSearch ${VERSION} for targets: ${TARGETS}" >&2
 rm -rf "$DIST_DIR"
@@ -43,9 +35,19 @@ for target in $TARGETS; do
 
   pushd "$DIST_DIR" >/dev/null
   if [[ "$target" == *"windows"* ]]; then
-    zip -rq "$(basename "$artifact_root").zip" "$(basename "$artifact_root")"
+    archive_name="$(basename "$artifact_root").zip"
+    zip -rq "$archive_name" "$(basename "$artifact_root")"
   else
-    tar -czf "$(basename "$artifact_root").tar.gz" "$(basename "$artifact_root")"
+    archive_name="$(basename "$artifact_root").tar.gz"
+    tar -czf "$archive_name" "$(basename "$artifact_root")"
+  fi
+
+  sha256sum "$archive_name" >"$archive_name.sha256"
+
+  if [[ "${SIGN_ARTIFACTS:-0}" == "1" ]]; then
+    gpg_args=(--detach-sign --armor)
+    [[ -n "${GPG_SIGNING_KEY:-}" ]] && gpg_args+=(--local-user "$GPG_SIGNING_KEY")
+    gpg "${gpg_args[@]}" "$archive_name"
   fi
   popd >/dev/null
 

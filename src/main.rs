@@ -292,6 +292,11 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
         .writer(INDEX_WRITER_HEAP_BYTES)
         .context("Failed to create Tantivy index writer")?;
 
+    // Clear existing documents so the index matches the current filesystem state.
+    writer
+        .delete_all_documents()
+        .context("Failed to clear existing index documents")?;
+
     let mut indexed_files = 0usize;
     let mut skipped_files = 0usize;
 

@@ -551,3 +551,57 @@ fn read_file_streaming(path: &Path, size_hint: u64) -> Result<String> {
 
     Ok(contents)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_is_text_like_matches_known_extensions() {
+        assert!(is_text_like(Path::new("notes.txt")));
+        assert!(is_text_like(Path::new("script.rs")));
+        assert!(!is_text_like(Path::new("archive.zip")));
+        assert!(!is_text_like(Path::new("no_extension")));
+    }
+
+    #[test]
+    fn test_is_probably_binary_detects_null_bytes_and_utf8_errors() {
+        let mut text_file = NamedTempFile::new().expect("create temp file");
+        writeln!(text_file, "plain text content").expect("write text");
+
+        let mut binary_file = NamedTempFile::new().expect("create temp file");
+        binary_file
+            .write_all(b"binary\0content")
+            .expect("write binary");
+
+        assert_eq!(is_probably_binary(text_file.path()).unwrap(), false);
+        assert_eq!(is_probably_binary(binary_file.path()).unwrap(), true);
+    }
+
+    #[test]
+    fn test_read_file_streaming_reads_all_contents() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        writeln!(file, "line one").expect("write line one");
+        writeln!(file, "line two").expect("write line two");
+
+        let metadata = file.as_file().metadata().expect("metadata");
+        let contents = read_file_streaming(file.path(), metadata.len()).expect("read contents");
+
+        assert!(contents.contains("line one"));
+        assert!(contents.contains("line two"));
+    }
+
+    #[test]
+    fn test_read_file_streaming_errors_when_size_hint_exceeds_limit() {
+        let mut file = NamedTempFile::new().expect("create temp file");
+        writeln!(file, "small").expect("write content");
+
+        let oversized_hint = MAX_FILE_SIZE_BYTES + 1;
+        let err = read_file_streaming(file.path(), oversized_hint).unwrap_err();
+
+        let message = format!("{err}");
+        assert!(message.contains("size limit"));
+    }
+}

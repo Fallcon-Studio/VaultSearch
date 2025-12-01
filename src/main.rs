@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand, ValueHint};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,9 @@ struct AppConfig {
     root: String,
     /// Directory where the Tantivy index is stored
     index_dir: String,
+    /// Timestamp of last successful indexing run
+    #[serde(default)]
+    last_indexed: Option<String>,
 }
 
 const INDEX_WRITER_HEAP_BYTES: usize = 50_000_000;
@@ -147,14 +151,13 @@ fn cmd_init(root: &str, force: bool) -> Result<()> {
     };
 
     // 4) Save config file.
-    let cfg = AppConfig {
+    let mut cfg = AppConfig {
         root: root_path.to_string_lossy().to_string(),
         index_dir: index_dir.to_string_lossy().to_string(),
+        last_indexed: None,
     };
 
-    let cfg_toml = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
-    fs::write(&config_path, cfg_toml)
-        .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+    write_config(&cfg, &config_path)?;
 
     println!("Initialized vaultsearch:");
     println!("  Root directory : {}", cfg.root);
@@ -162,13 +165,93 @@ fn cmd_init(root: &str, force: bool) -> Result<()> {
     println!("  Index status   : {index_status}");
     println!("  Config file    : {}", config_path.display());
 
+    println!("\nStarting initial indexing run...");
+    perform_indexing(&mut cfg)?;
+
     Ok(())
 }
 
 fn cmd_index() -> Result<()> {
+    let mut cfg = load_config()?;
+    perform_indexing(&mut cfg)
+}
+
+fn cmd_search(query: &str) -> Result<()> {
     let cfg = load_config()?;
+    let index_dir = Path::new(&cfg.index_dir);
+
+    if cfg.last_indexed.is_none() {
+        println!(
+            "Index has not been built yet for {}. Run `vaultsearch index` to scan your files.",
+            cfg.root
+        );
+        return Ok(());
+    }
+
+    if !tantivy_index_exists(index_dir) {
+        println!(
+            "Index directory missing at {}. Re-run `vaultsearch init` followed by `vaultsearch index`.",
+            index_dir.display()
+        );
+        return Ok(());
+    }
+
+    let index = open_index(index_dir)?;
+    let schema = index.schema();
+
+    let path_field = schema.get_field("path").expect("path field");
+    let contents_field = schema.get_field("contents").expect("contents field");
+
+    let reader = index.reader().context("Failed to create index reader")?;
+    let searcher = reader.searcher();
+
+    if searcher.num_docs() == 0 {
+        println!(
+            "Index is empty. Run `vaultsearch index` to index files under {}.",
+            cfg.root
+        );
+        return Ok(());
+    }
+
+    let query_parser = QueryParser::for_index(&index, vec![path_field, contents_field]);
+
+    let tantivy_query = query_parser
+        .parse_query(query)
+        .with_context(|| format!("Failed to parse query: {query}"))?;
+
+    let top_docs = searcher
+        .search(&tantivy_query, &TopDocs::with_limit(TOP_RESULTS))
+        .context("Search failed")?;
+
+    if top_docs.is_empty() {
+        println!("No results found for query: {query}");
+        return Ok(());
+    }
+
+    println!("Results for query: {query}");
+    for (rank, (score, doc_address)) in top_docs.into_iter().enumerate() {
+        let retrieved_doc: TantivyDocument = searcher
+            .doc(doc_address)
+            .context("Failed to load document")?;
+
+        let json = retrieved_doc.to_json(&schema);
+
+        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, json);
+    }
+
+    Ok(())
+}
+
+fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
     let root = Path::new(&cfg.root);
     let index_dir = Path::new(&cfg.index_dir);
+
+    if !tantivy_index_exists(index_dir) {
+        anyhow::bail!(
+            "Index missing at {}. Re-run `vaultsearch init` to recreate it.",
+            index_dir.display()
+        );
+    }
 
     println!("Indexing...");
     println!("  Root directory : {}", root.display());
@@ -232,54 +315,16 @@ fn cmd_index() -> Result<()> {
 
     writer.commit().context("Failed to commit index to disk")?;
 
+    cfg.last_indexed = Some(Utc::now().to_rfc3339());
+    save_config(cfg)?;
+
     println!("Indexing complete.");
     println!("  Indexed files : {indexed_files}");
     println!("  Skipped files : {skipped_files}");
-
-    Ok(())
-}
-
-fn cmd_search(query: &str) -> Result<()> {
-    let cfg = load_config()?;
-    let index_dir = Path::new(&cfg.index_dir);
-
-    let index = open_index(index_dir)?;
-    let schema = index.schema();
-
-    let path_field = schema.get_field("path").expect("path field");
-    let contents_field = schema.get_field("contents").expect("contents field");
-
-    let reader = index
-        .reader_builder()
-        .try_into()
-        .context("Failed to create index reader")?;
-    let searcher = reader.searcher();
-
-    let query_parser = QueryParser::for_index(&index, vec![path_field, contents_field]);
-
-    let tantivy_query = query_parser
-        .parse_query(query)
-        .with_context(|| format!("Failed to parse query: {query}"))?;
-
-    let top_docs = searcher
-        .search(&tantivy_query, &TopDocs::with_limit(TOP_RESULTS))
-        .context("Search failed")?;
-
-    if top_docs.is_empty() {
-        println!("No results found for query: {query}");
-        return Ok(());
-    }
-
-    println!("Results for query: {query}");
-    for (rank, (score, doc_address)) in top_docs.into_iter().enumerate() {
-        let retrieved_doc: TantivyDocument = searcher
-            .doc(doc_address)
-            .context("Failed to load document")?;
-
-        let json = retrieved_doc.to_json(&schema);
-
-        println!("{:>2}. [score: {:.3}] {}", rank + 1, score, json);
-    }
+    println!(
+        "  Last indexed  : {}",
+        cfg.last_indexed.as_deref().unwrap_or("unknown")
+    );
 
     Ok(())
 }
@@ -316,6 +361,19 @@ fn load_config() -> Result<AppConfig> {
 
     let cfg: AppConfig = toml::from_str(&data).with_context(|| "Failed to parse config TOML")?;
     Ok(cfg)
+}
+
+fn save_config(cfg: &AppConfig) -> Result<()> {
+    let proj_dirs = get_project_dirs()?;
+    let config_path = config_file_path(&proj_dirs)?;
+    write_config(cfg, &config_path)
+}
+
+fn write_config(cfg: &AppConfig, config_path: &Path) -> Result<()> {
+    let cfg_toml = toml::to_string_pretty(cfg).context("Failed to serialize config to TOML")?;
+    fs::write(config_path, cfg_toml)
+        .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+    Ok(())
 }
 
 // ---- Index helpers ----

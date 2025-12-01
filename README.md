@@ -46,7 +46,7 @@ Run `vaultsearch --help` to see all options. The typical workflow looks like thi
    ```bash
    vaultsearch init --root /path/to/documents
    ```
-   This stores a `config.toml` alongside a Tantivy index in your platform's configuration/data directory (e.g., `~/.config/vaultsearch`).
+   This stores a `config.toml` in your platform's configuration directory (e.g., `~/.config/vaultsearch`) and a Tantivy index under your platform's data directory (e.g., `~/.local/share/vaultsearch/index`).
 
 2. **Index** the files under your root directory
    ```bash
@@ -58,12 +58,14 @@ Run `vaultsearch --help` to see all options. The typical workflow looks like thi
    ```bash
    vaultsearch search "invoice 2024"
    ```
-   The top-ranked results (by score) are printed as JSON documents containing the file path and indexed contents.
+   The top-ranked results (by score) are printed as a human-readable list that includes the rank, score, relative path (if it
+   lives under your configured root), and a highlighted text snippet.
 
 ## Configuration
 The tool stores configuration and index data using your OS-specific directories (provided by the `directories` crate). On most systems you can find:
 - `config.toml` under the user configuration directory (e.g., `~/.config/vaultsearch`).
-- Index data under the user local data directory (e.g., `~/.local/share/vaultsearch/index`).
+- Index data under the user local data directory (e.g., `~/.local/share/vaultsearch/index`). These are separate directories: the
+  configuration file is not stored alongside the Tantivy index.
 
 You can edit `config.toml` manually if you need to change the root or index location, or rerun `vaultsearch init` with a different `--root` to recreate it.
 

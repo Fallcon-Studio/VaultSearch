@@ -1,17 +1,20 @@
 use anyhow::{Context, Result};
+use blake3::Hasher;
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueHint};
 use directories::ProjectDirs;
 use html_escape::decode_html_entities;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, SchemaBuilder, TantivyDocument, Value, STORED, TEXT};
+use tantivy::schema::{Schema, SchemaBuilder, TantivyDocument, Value, STORED, STRING, TEXT};
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{doc, Index};
+use tantivy::{doc, Index, Term};
 
 /// Local file search tool (offline, private).
 #[derive(Parser, Debug)]
@@ -65,6 +68,7 @@ const INDEX_PROGRESS_CHUNK: usize = 100;
 const TOP_RESULTS: usize = 20;
 const MAX_FILE_SIZE_BYTES: u64 = 5_000_000;
 const BINARY_SNIFF_BYTES: usize = 4_096;
+const METADATA_FILE: &str = "file_metadata.json";
 const TEXT_LIKE_EXTENSIONS: &[&str] = &[
     "txt", "md", "rst", "log", "json", "toml", "yaml", "yml", "ini", "cfg", "rs", "lock", "c",
     "cpp", "h", "hpp", "cs", "java", "py", "go", "rb", "php", "js", "ts", "tsx", "jsx", "html",
@@ -287,6 +291,7 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
     let schema = index.schema();
 
     let path_field = schema.get_field("path").expect("path field");
+    let path_exact_field = schema.get_field("path_exact").expect("path_exact field");
     let contents_field = schema.get_field("contents").expect("contents field");
 
     // Tantivy index writer: 50 MB heap
@@ -294,13 +299,17 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
         .writer(INDEX_WRITER_HEAP_BYTES)
         .context("Failed to create Tantivy index writer")?;
 
-    // Clear existing documents so the index matches the current filesystem state.
-    writer
-        .delete_all_documents()
-        .context("Failed to clear existing index documents")?;
+    let previous_metadata = load_file_metadata(index_dir).unwrap_or_else(|e| {
+        eprintln!(
+            "  [warn] Failed to load previous metadata ({}). Starting fresh.",
+            e
+        );
+        HashMap::new()
+    });
 
-    let mut indexed_files = 0usize;
+    let mut new_metadata: HashMap<String, FileMetadata> = HashMap::new();
     let mut skip_stats = SkipStats::default();
+    let mut stats = IndexingStats::default();
 
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
@@ -352,23 +361,58 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
             }
         }
 
-        match read_file_streaming(path, metadata.len()) {
-            Ok(contents) => {
-                let path_str = path.to_string_lossy().to_string();
+        let path_str = path.to_string_lossy().to_string();
+        let modified = match file_modified_timestamp(&metadata) {
+            Ok(ts) => ts,
+            Err(e) => {
+                eprintln!("  [skip] Failed to read modified time for {path_display}: {e}");
+                skip_stats.read_errors += 1;
+                continue;
+            }
+        };
 
+        if let Some(previous) = previous_metadata.get(&path_str) {
+            if previous.modified == modified && previous.size == metadata.len() {
+                stats.unchanged += 1;
+                new_metadata.insert(path_str.clone(), previous.clone());
+                continue;
+            }
+        }
+
+        match read_file_streaming(path, metadata.len()) {
+            Ok(file_data) => {
                 let doc = doc!(
-                    path_field => path_str,
-                    contents_field => contents,
+                    path_field => path_str.clone(),
+                    path_exact_field => path_str.clone(),
+                    contents_field => file_data.contents,
                 );
+
+                if previous_metadata.contains_key(&path_str) {
+                    writer.delete_term(Term::from_field_text(path_exact_field, &path_str));
+                    stats.updated += 1;
+                } else {
+                    stats.indexed += 1;
+                }
 
                 writer
                     .add_document(doc)
                     .with_context(|| format!("Failed to add document for {}", path.display()))?;
 
-                indexed_files += 1;
+                new_metadata.insert(
+                    path_str.clone(),
+                    FileMetadata {
+                        path: path_str,
+                        modified,
+                        size: metadata.len(),
+                        hash: file_data.hash,
+                    },
+                );
 
-                if indexed_files % INDEX_PROGRESS_CHUNK == 0 {
-                    println!("  Indexed {indexed_files} files so far...");
+                if (stats.indexed + stats.updated) % INDEX_PROGRESS_CHUNK == 0 {
+                    println!(
+                        "  Indexed/updated {} files so far...",
+                        stats.indexed + stats.updated
+                    );
                 }
             }
             Err(e) => {
@@ -378,14 +422,28 @@ fn perform_indexing(cfg: &mut AppConfig) -> Result<()> {
         }
     }
 
+    for (path, _) in previous_metadata
+        .iter()
+        .filter(|(p, _)| !new_metadata.contains_key(*p))
+    {
+        writer.delete_term(Term::from_field_text(path_exact_field, path));
+        stats.removed += 1;
+    }
+
     writer.commit().context("Failed to commit index to disk")?;
+
+    save_file_metadata(index_dir, &new_metadata)
+        .context("Failed to persist file metadata alongside index")?;
 
     cfg.last_indexed = Some(Utc::now().to_rfc3339());
     save_config(cfg)?;
 
     println!("Indexing complete.");
-    println!("  Indexed files : {indexed_files}");
-    println!("  Skipped files : {}", skip_stats.total());
+    println!("  Added files    : {}", stats.indexed);
+    println!("  Updated files  : {}", stats.updated);
+    println!("  Unchanged files: {}", stats.unchanged);
+    println!("  Removed files  : {}", stats.removed);
+    println!("  Skipped files  : {}", skip_stats.total());
     println!(
         "    - Unsupported extension : {}",
         skip_stats.unsupported_extension
@@ -413,6 +471,22 @@ impl SkipStats {
     fn total(&self) -> usize {
         self.unsupported_extension + self.too_large + self.binary + self.read_errors
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileMetadata {
+    path: String,
+    modified: i64,
+    size: u64,
+    hash: String,
+}
+
+#[derive(Default)]
+struct IndexingStats {
+    indexed: usize,
+    updated: usize,
+    unchanged: usize,
+    removed: usize,
 }
 
 // ---- Config helpers ----
@@ -479,11 +553,47 @@ fn open_index(index_dir: &Path) -> Result<Index> {
     Index::open_in_dir(index_dir).context("Failed to open Tantivy index")
 }
 
+fn metadata_file_path(index_dir: &Path) -> PathBuf {
+    index_dir.join(METADATA_FILE)
+}
+
+fn load_file_metadata(index_dir: &Path) -> Result<HashMap<String, FileMetadata>> {
+    let path = metadata_file_path(index_dir);
+
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let data = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read metadata file at {}", path.display()))?;
+
+    let entries: Vec<FileMetadata> = serde_json::from_str(&data)
+        .with_context(|| format!("Failed to parse metadata file at {}", path.display()))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect())
+}
+
+fn save_file_metadata(index_dir: &Path, metadata: &HashMap<String, FileMetadata>) -> Result<()> {
+    let path = metadata_file_path(index_dir);
+    let entries: Vec<&FileMetadata> = metadata.values().collect();
+    let serialized =
+        serde_json::to_string_pretty(&entries).context("Failed to serialize file metadata")?;
+    fs::write(&path, serialized)
+        .with_context(|| format!("Failed to write metadata file at {}", path.display()))?;
+    Ok(())
+}
+
 fn build_schema() -> Schema {
     let mut schema_builder: SchemaBuilder = Schema::builder();
 
     // Path: stored so we can print it in results, also tokenized to search by path pieces.
     schema_builder.add_text_field("path", TEXT | STORED);
+
+    // Exact path: used for document replacement / deletion without tokenization.
+    schema_builder.add_text_field("path_exact", STRING | STORED);
 
     // Contents: main text content we will index for full-text search.
     schema_builder.add_text_field("contents", TEXT | STORED);
@@ -523,13 +633,30 @@ fn is_probably_binary(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn read_file_streaming(path: &Path, size_hint: u64) -> Result<String> {
+fn file_modified_timestamp(metadata: &fs::Metadata) -> Result<i64> {
+    let modified_time = metadata
+        .modified()
+        .context("Failed to read file modified timestamp")?;
+    let duration: Duration = modified_time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    Ok(duration.as_secs() as i64)
+}
+
+#[derive(Debug)]
+struct FileReadResult {
+    contents: String,
+    hash: String,
+}
+
+fn read_file_streaming(path: &Path, size_hint: u64) -> Result<FileReadResult> {
     let file =
         fs::File::open(path).with_context(|| format!("Failed to open file {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut contents = String::new();
     let mut line = String::new();
     let mut total_bytes: u64 = 0;
+    let mut hasher = Hasher::new();
 
     while reader
         .read_line(&mut line)
@@ -545,11 +672,14 @@ fn read_file_streaming(path: &Path, size_hint: u64) -> Result<String> {
             );
         }
 
+        hasher.update(line.as_bytes());
         contents.push_str(&line);
         line.clear();
     }
 
-    Ok(contents)
+    let hash = hasher.finalize().to_hex().to_string();
+
+    Ok(FileReadResult { contents, hash })
 }
 
 #[cfg(test)]
@@ -587,10 +717,11 @@ mod tests {
         writeln!(file, "line two").expect("write line two");
 
         let metadata = file.as_file().metadata().expect("metadata");
-        let contents = read_file_streaming(file.path(), metadata.len()).expect("read contents");
+        let file_data = read_file_streaming(file.path(), metadata.len()).expect("read contents");
 
-        assert!(contents.contains("line one"));
-        assert!(contents.contains("line two"));
+        assert!(file_data.contents.contains("line one"));
+        assert!(file_data.contents.contains("line two"));
+        assert!(!file_data.hash.is_empty());
     }
 
     #[test]

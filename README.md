@@ -73,7 +73,9 @@ You can edit `config.toml` manually if you need to change the root or index loca
 - Run `scripts/package-release.sh` from the repository root to produce platform-specific archives under `dist/`. The script pins dependencies via `Cargo.lock` (`--locked`) and reuses the shared `target/` directory so repeated runs emit consistent outputs.
 - Set the `TARGETS` environment variable to customize the build matrix (default targets: `x86_64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-apple-darwin`).
 - Each archive contains the `vaultsearch` binary alongside `README.md` and `CHANGELOG.md` so consumers can keep documentation in sync with the shipped version.
-- Prerequisites: the Rust toolchain (with `rustup` for target installation) plus `tar` and `zip` for packaging.
+- Checksums and signatures: the packaging script writes a `.sha256` file next to each archive and, when `SIGN_ARTIFACTS=1` is set, generates an armored detached signature (`.asc`) using `gpg` (optionally controlled by `GPG_SIGNING_KEY`). These live in `dist/` alongside the archives.
+- Verification: `cd dist && sha256sum -c vaultsearch-<VERSION>-<TARGET>.tar.gz.sha256` (or `.zip.sha256`) to check the checksum, then `gpg --verify vaultsearch-<VERSION>-<TARGET>.tar.gz.asc` if signatures were produced.
+- Prerequisites: the Rust toolchain (with `rustup` for target installation), `jq` for reading cargo metadata, `tar` and `zip` for packaging, and optionally `gpg` for signatures.
 
 ## Release notes and versioning
 - VaultSearch follows semantic versioning; the current release is **0.2.0** (see `Cargo.toml`).

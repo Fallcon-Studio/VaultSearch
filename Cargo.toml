@@ -12,3 +12,4 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 directories = "5.0"
 chrono = { version = "0.4", features = ["clock"] }
+html-escape = "0.2"
